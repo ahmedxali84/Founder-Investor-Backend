@@ -1,0 +1,56 @@
+# =========================
+# Python
+# =========================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# =========================
+# Virtual Environments
+# =========================
+venv/
+.venv/
+env/
+ENV/
+
+# =========================
+# Testing
+# =========================
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+.mypy_cache/
+.ruff_cache/
+
+# =========================
+# Build / Distribution
+# =========================
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# =========================
+# Local configuration
+# =========================
+local_settings.py
+instance/
+
+# =========================
+# Runtime / generated data — these are produced by running the app locally,
+# not source code, and shouldn't be committed (also frequently contain
+# whoever-tested-last's personal data, e.g. their generated resume).
+# =========================
+sessions_db.json
+agent_profiles.db
+*.db
+*.sqlite
+*.sqlite3
+temp/
+tmp/
+static/resumes/*.docx
+!static/resumes/.gitkeep
