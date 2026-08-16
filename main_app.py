@@ -104,7 +104,7 @@ async def _startup():
 # overridable via CORS_ORIGINS for other environments.
 _cors_origins_env = os.getenv("CORS_ORIGINS", "").strip()
 if not _cors_origins_env:
-    _cors_origins = ["http://localhost:3000", "http://localhost:5173", "http://localhost:5174", "http://127.0.0.1:3000"]
+    _cors_origins = ["http://localhost:3000", "http://localhost:5173", "http://localhost:5174", "http://127.0.0.1:3000", "https://founder-investor-liard.vercel.app"]
 elif _cors_origins_env == "*":
     _cors_origins = ["*"]
 else:
@@ -116,7 +116,7 @@ app.add_middleware(
     allow_credentials=True if _cors_origins != ["*"] else False,
     allow_methods=["*"],
     allow_headers=["*"],
-    allow_origin_regex=r"https://.*\.vercel\.app" if os.getenv("ENVIRONMENT") == "production" else None,
+    allow_origin_regex=r"https://.*\.vercel\.app",
 )
 
 # Lightweight, dependency-free abuse guard + browser hardening headers. Not a
