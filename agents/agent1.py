@@ -18,13 +18,17 @@ Document text:
 
 IDEA_EXTRACTION_PROMPT = """You are analyzing a startup idea document.
 
-Read the text below and identify three things:
+Read the text below and identify four things:
 1. The core problem being solved
 2. The proposed solution
 3. The target market (who this is for)
+4. The single business domain/category this startup belongs to — a short, standard category
+   an investor would recognize and filter by (e.g. FinTech, HealthTech, EdTech, AI, SaaS,
+   E-commerce, Climate Tech, Cybersecurity, Logistics). This describes the STARTUP's market
+   category, not the founder's technical skills or the tech stack used to build it.
 
 Respond with ONLY a JSON object in this exact format, no extra text:
-{{"problem": "...", "solution": "...", "target_market": "..."}}
+{{"problem": "...", "solution": "...", "target_market": "...", "domain": "..."}}
 
 Idea document text:
 {pdf_text}
@@ -53,6 +57,38 @@ Must-have features: {must_have}
 Respond with ONLY a JSON object in this exact format, no extra text:
 {{"steps": ["Step 1: ...", "Step 2: ...", "..."]}}
 """
+
+DOMAIN_CLASSIFICATION_PROMPT = """You are classifying an existing startup idea into a business domain.
+
+Problem: {problem}
+Solution: {solution}
+Target market: {target_market}
+
+Identify the single business domain/category this startup belongs to — a short, standard
+category an investor would recognize and filter by (e.g. FinTech, HealthTech, EdTech, AI,
+SaaS, E-commerce, Climate Tech, Cybersecurity, Logistics). This describes the STARTUP's
+market category, not any technical skills or tech stack.
+
+Respond with ONLY a JSON object in this exact format, no extra text:
+{{"domain": "..."}}
+"""
+
+
+def classify_idea_domain(problem: str, solution: str, target_market: str) -> str:
+    """
+    Classifies an idea whose problem/solution/target_market are already known
+    into a single business domain, without re-running the rest of Agent 1's
+    pipeline. Used by scripts/backfill_idea_domains.py to correct ideas
+    saved before domain was classified at extraction time (see
+    IDEA_EXTRACTION_PROMPT) — those had domain copied from the founder's own
+    specialization instead, a real bug fixed this session.
+    """
+    res = ask_llm_json(
+        DOMAIN_CLASSIFICATION_PROMPT.format(problem=problem, solution=solution, target_market=target_market),
+        system_prompt="You are a startup analyst that classifies businesses into standard investor-facing categories in valid JSON.",
+    )
+    return (res.get("domain") or "").strip() or "SaaS"
+
 
 def extract_pdf_text(pdf_path: str) -> str:
     """Extract all text from a PDF file using pdfplumber."""
@@ -120,7 +156,14 @@ def run_agent1(pdf_path_or_text: str, is_raw_text: bool = False) -> dict:
         "idea": {
             "problem": idea_data.get("problem", ""),
             "solution": idea_data.get("solution", ""),
-            "target_market": idea_data.get("target_market", "")
+            "target_market": idea_data.get("target_market", ""),
+            # Falls back to "SaaS" (matching the generic default this already
+            # had before domain was sourced correctly) if the LLM omits it or
+            # returns an empty string, rather than leaving ideas with no
+            # domain at all — match_score's sector-fit check just scores 0 in
+            # that case rather than crashing, same as any other real category
+            # that doesn't happen to be in an investor's focus_sectors.
+            "domain": (idea_data.get("domain") or "").strip() or "SaaS",
         },
         "mvp": {
             "must_have": mvp_data.get("must_have", []),

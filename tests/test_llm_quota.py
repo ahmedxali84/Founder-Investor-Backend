@@ -1,7 +1,11 @@
 """
 Regression coverage for agents/llm.py's TPD (daily quota) fast-fail path
-added this session — a real Groq daily-quota response should raise
-GroqQuotaExhaustedError immediately, not burn through all 3 retries first.
+added this session — a real Groq daily-quota response on one model should
+raise immediately within that model (not burn through all 3 retries), but
+still fall through to try each of the other FALLBACK_MODELS once before
+finally raising GroqQuotaExhaustedError — that fallback chain is the whole
+point of FALLBACK_MODELS existing, so "fail fast" means no wasted retries
+per model, not "give up on the first model's quota without trying the rest."
 A per-minute 429 (no "per day" in the message) must still use the existing
 retry/backoff behavior unchanged.
 """
@@ -59,7 +63,10 @@ def test_tpd_quota_fails_fast_without_exhausting_retries(monkeypatch):
     with pytest.raises(llm_module.GroqQuotaExhaustedError):
         llm_module.ask_llm("hello", _max_retries=3)
 
-    assert call_count == 1, "should fail on the first 429, not retry a hopeless daily quota"
+    # One call per model in the fallback chain (primary + 2 fallbacks) —
+    # each fails fast on its own hopeless daily quota (no 3x retry loop per
+    # model) but the chain itself still runs to completion before giving up.
+    assert call_count == 3, "should fail fast within each model, but still try every fallback model"
 
 
 def test_per_minute_429_still_retries_as_before(monkeypatch):

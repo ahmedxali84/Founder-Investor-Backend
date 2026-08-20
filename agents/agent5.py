@@ -15,7 +15,7 @@ def estimate_mvp_readiness(idea):
         steps = []
         
     late_stage_hits = sum(
-        1 for phase in steps if any(k in phase.lower() for k in LATE_STAGE_KEYWORDS)
+        1 for phase in steps if isinstance(phase, str) and any(k in phase.lower() for k in LATE_STAGE_KEYWORDS)
     )
     completion = min(100, feasibility + (late_stage_hits * 4))
 

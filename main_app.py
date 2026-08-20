@@ -5,10 +5,12 @@ import asyncio
 import uuid
 import time
 import hashlib
+import ipaddress
+import socket
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import quote, urlparse, urljoin
 from typing import Optional
 from fastapi import FastAPI, Form, HTTPException, BackgroundTasks, Depends, Header, UploadFile, File
 from fastapi.responses import JSONResponse, RedirectResponse, FileResponse
@@ -104,7 +106,7 @@ async def _startup():
 # overridable via CORS_ORIGINS for other environments.
 _cors_origins_env = os.getenv("CORS_ORIGINS", "").strip()
 if not _cors_origins_env:
-    _cors_origins = ["http://localhost:3000", "http://localhost:5173", "http://localhost:5174", "http://127.0.0.1:3000", "https://founder-investor-liard.vercel.app"]
+    _cors_origins = ["http://localhost:3000", "http://localhost:5173", "http://localhost:5174", "http://127.0.0.1:3000"]
 elif _cors_origins_env == "*":
     _cors_origins = ["*"]
 else:
@@ -116,7 +118,7 @@ app.add_middleware(
     allow_credentials=True if _cors_origins != ["*"] else False,
     allow_methods=["*"],
     allow_headers=["*"],
-    allow_origin_regex=r"https://.*\.vercel\.app",
+    allow_origin_regex=r"https://.*\.vercel\.app" if os.getenv("ENVIRONMENT") == "production" else None,
 )
 
 # Lightweight, dependency-free abuse guard + browser hardening headers. Not a
@@ -608,12 +610,59 @@ def _is_valid_url(url: str) -> bool:
     return bool(pattern.match(url.strip()))
 
 
-async def _reachable_url(url: str) -> bool:
-    """Quick HEAD request to check if the MVP URL is reachable."""
+def _is_public_hostname(hostname: str) -> bool:
+    """
+    Resolves hostname and rejects it unless every address it resolves to is
+    an ordinary public IP — private/loopback/link-local (which covers cloud
+    metadata endpoints like 169.254.169.254), multicast, reserved, and
+    unspecified are all refused. Without this, _reachable_url's outbound
+    request is a blind SSRF/internal-network-scanning oracle: any
+    authenticated founder could point mvp_url at internal infrastructure —
+    either a literal internal IP, or an attacker-controlled domain that
+    simply resolves to one — and read back whether it's alive.
+    Note: this doesn't fully close DNS-rebinding (a record that resolves
+    differently between this check and httpx's own connection a moment
+    later) — a residual risk, not one this app's threat model prioritizes
+    closing further right now.
+    """
     try:
-        async with httpx.AsyncClient(timeout=6.0, follow_redirects=True) as client:
-            resp = await client.head(url)
+        infos = socket.getaddrinfo(hostname, None)
+    except socket.gaierror:
+        return False
+    if not infos:
+        return False
+    for info in infos:
+        try:
+            ip = ipaddress.ip_address(info[4][0])
+        except ValueError:
+            return False
+        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_reserved or ip.is_unspecified:
+            return False
+    return True
+
+
+async def _reachable_url(url: str) -> bool:
+    """
+    Quick HEAD request to check if the MVP URL is reachable — only after
+    confirming the hostname resolves exclusively to public addresses (see
+    _is_public_hostname). Redirects are followed manually, one hop at a
+    time, re-validating the target host on every hop instead of letting
+    httpx's follow_redirects silently land on an internal address that
+    passed no check of its own.
+    """
+    try:
+        current_url = url
+        for _ in range(5):
+            hostname = urlparse(current_url).hostname
+            if not hostname or not _is_public_hostname(hostname):
+                return False
+            async with httpx.AsyncClient(timeout=6.0, follow_redirects=False) as client:
+                resp = await client.head(current_url)
+            if resp.status_code in (301, 302, 303, 307, 308) and resp.headers.get("location"):
+                current_url = urljoin(current_url, resp.headers["location"])
+                continue
             return resp.status_code < 500
+        return False
     except Exception:
         return False
 
@@ -769,7 +818,19 @@ def _run_idea_activation_pipeline(user_id: str, idea_text: str, mvp_url: str, re
                 new_idea = {
                     "id": new_id,
                     "title": title,
-                    "domain": profile_data.get("specialization", "SaaS"),
+                    # Was profile_data.get("specialization", "SaaS") — the
+                    # startup's business domain was being set to the
+                    # FOUNDER's personal tech specialization (the same value
+                    # that also populates founder.specialization two lines
+                    # below), not the idea's actual category. That made
+                    # match_score's sector-fit check (idea_domain in
+                    # investor.focus_sectors, 40 of 100 points) compare a
+                    # skills string like "Fullstack, AI, Data Analysis"
+                    # against an investor's clean focus sectors like ["AI",
+                    # "SaaS"] — never matching, so the single largest
+                    # component of every match score silently scored zero.
+                    # Now sourced from Agent 1's own domain classification.
+                    "domain": agent1_res["idea"].get("domain") or "SaaS",
                     "problem": agent1_res["idea"]["problem"],
                     "solution": agent1_res["idea"]["solution"],
                     "target_market": agent1_res["idea"]["target_market"],
@@ -1075,22 +1136,37 @@ async def _delete_storage_prefix(client: httpx.AsyncClient, supabase_url: str, h
     Best-effort: a failure here shouldn't block the rest of deletion.
     """
     try:
-        list_resp = await client.post(
-            f"{supabase_url.rstrip('/')}/storage/v1/object/list/{bucket}",
-            headers=headers,
-            json={"prefix": f"{prefix}/", "limit": 1000},
-        )
-        if list_resp.status_code != 200:
-            return
-        items = list_resp.json()
-        paths = [f"{prefix}/{item['name']}" for item in items if item.get("name")]
-        if paths:
-            await client.request(
-                "DELETE",
-                f"{supabase_url.rstrip('/')}/storage/v1/object/{bucket}",
+        limit = 1000
+        # Each successful delete shrinks what a fresh list (still offset 0)
+        # returns next, so looping until a page comes back under `limit` —
+        # rather than listing once — covers accounts with more than 1000
+        # objects instead of silently orphaning the remainder after what's
+        # documented as permanent, irreversible deletion. The iteration cap
+        # is just a safety net against looping forever if a delete call ever
+        # silently fails to actually remove anything.
+        for _ in range(50):
+            list_resp = await client.post(
+                f"{supabase_url.rstrip('/')}/storage/v1/object/list/{bucket}",
                 headers=headers,
-                json={"prefixes": paths},
+                json={"prefix": f"{prefix}/", "limit": limit},
             )
+            if list_resp.status_code != 200:
+                return
+            items = list_resp.json()
+            if not items:
+                return
+            paths = [f"{prefix}/{item['name']}" for item in items if item.get("name")]
+            if paths:
+                del_resp = await client.request(
+                    "DELETE",
+                    f"{supabase_url.rstrip('/')}/storage/v1/object/{bucket}",
+                    headers=headers,
+                    json={"prefixes": paths},
+                )
+                if del_resp.status_code >= 300:
+                    return
+            if len(items) < limit:
+                return
     except Exception as e:
         print(f"[delete_account] storage cleanup failed for {bucket}/{prefix}: {e}")
 
@@ -1374,11 +1450,21 @@ async def extract_idea_pdf(
 
     tmp_path = f"temp/{uuid.uuid4()}.pdf"
     try:
-        contents = await idea_pdf.read()
-        if len(contents) > MAX_PDF_UPLOAD_BYTES:
-            raise HTTPException(status_code=413, detail="PDF is too large — please upload a file under 15MB.")
+        # Read in bounded chunks and check the running total as we go, rather
+        # than idea_pdf.read() (which buffers the entire body before the size
+        # check ever runs) — that made MAX_PDF_UPLOAD_BYTES bound only what
+        # got written to disk, not what got read into memory first.
+        total = 0
+        chunk_size = 1024 * 1024
         with open(tmp_path, "wb") as f:
-            f.write(contents)
+            while True:
+                chunk = await idea_pdf.read(chunk_size)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > MAX_PDF_UPLOAD_BYTES:
+                    raise HTTPException(status_code=413, detail="PDF is too large — please upload a file under 15MB.")
+                f.write(chunk)
         text = extract_pdf_text(tmp_path)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
