@@ -1693,6 +1693,12 @@ async def get_resume(owner_user_id: str, user_id: str = Depends(get_current_user
             )
             save_sessions()
         except Exception:
+            # Swallowing this without logging it would leave the actual
+            # cause (a Groq failure, a bad avatar URL, a disk-write error,
+            # ...) completely invisible — exactly the kind of silent
+            # failure this whole audit has been hunting down.
+            import traceback
+            traceback.print_exc()
             raise HTTPException(status_code=503, detail="Could not rebuild the resume right now — please try again.")
 
     return FileResponse(
