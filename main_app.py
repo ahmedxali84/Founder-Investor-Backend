@@ -118,7 +118,14 @@ app.add_middleware(
     allow_credentials=True if _cors_origins != ["*"] else False,
     allow_methods=["*"],
     allow_headers=["*"],
-    allow_origin_regex=r"https://.*\.vercel\.app" if os.getenv("ENVIRONMENT") == "production" else None,
+    # Always allow *.vercel.app regardless of an ENVIRONMENT env var being
+    # set — gating this behind ENVIRONMENT == "production" meant an unset
+    # ENVIRONMENT var (as on Render, where nothing sets it) silently
+    # rejected every request from the deployed Vercel frontend with
+    # "Disallowed CORS origin", surfacing to users as a raw "Failed to
+    # fetch". The regex is already scoped to vercel.app subdomains, so it
+    # doesn't need an extra env-var gate to stay safe.
+    allow_origin_regex=r"https://.*\.vercel\.app",
 )
 
 # Lightweight, dependency-free abuse guard + browser hardening headers. Not a
