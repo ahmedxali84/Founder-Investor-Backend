@@ -11,7 +11,13 @@ _root_env = Path(__file__).resolve().parent.parent / ".env"
 load_dotenv(dotenv_path=_root_env, override=True)
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
-GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile").strip()
+# Groq decommissioned every llama-3.x/mixtral chat model previously used here
+# (confirmed via a live /v1/models lookup against this account — none of
+# llama-3.3-70b-versatile, llama-3.1-8b-instant, or mixtral-8x7b-32768 exist
+# any more; two 404s and a "model_decommissioned" 400 respectively). The
+# gpt-oss models return the actual JSON in `content` with reasoning kept
+# separate in a `reasoning` field, so callers don't need to strip anything.
+GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b").strip()
 GROQ_CHAT_URL = "https://api.groq.com/openai/v1/chat/completions"
 
 # Agent 3 (resume) and Agent 7 (term sheet) draw from their own keys/quotas
@@ -37,7 +43,7 @@ class GroqQuotaExhaustedError(Exception):
     pass
 
 
-FALLBACK_MODELS = ["llama-3.1-8b-instant", "mixtral-8x7b-32768"]
+FALLBACK_MODELS = ["openai/gpt-oss-20b"]
 
 def ask_llm(prompt: str, system_prompt: str = "You are a helpful assistant.", _max_retries: int = 3, api_key: str = "") -> str:
     """Send a prompt to Groq and return the text reply. Retries with backoff on 429 (rate limit).

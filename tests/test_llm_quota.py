@@ -63,10 +63,10 @@ def test_tpd_quota_fails_fast_without_exhausting_retries(monkeypatch):
     with pytest.raises(llm_module.GroqQuotaExhaustedError):
         llm_module.ask_llm("hello", _max_retries=3)
 
-    # One call per model in the fallback chain (primary + 2 fallbacks) —
+    # One call per model in the fallback chain (primary + 1 fallback) —
     # each fails fast on its own hopeless daily quota (no 3x retry loop per
     # model) but the chain itself still runs to completion before giving up.
-    assert call_count == 3, "should fail fast within each model, but still try every fallback model"
+    assert call_count == 2, "should fail fast within each model, but still try every fallback model"
 
 
 def test_per_minute_429_still_retries_as_before(monkeypatch):
