@@ -842,7 +842,11 @@ def _run_idea_activation_pipeline(user_id: str, idea_text: str, mvp_url: str, re
                 else:
                     title = profile_data.get("name", "My Startup")
 
-            resume_url = f"/api/resume/{user_id}" if state.resume_path else None
+            # resume_path may currently be unset even for a founder with a
+            # real resume — /api/resume/{owner_user_id} rebuilds it on
+            # demand from founder_profile if the file didn't survive a
+            # redeploy, so expose the URL whenever either is present.
+            resume_url = f"/api/resume/{user_id}" if (state.resume_path or state.founder_profile) else None
 
             # Reuse this founder's existing idea id if they already had a live
             # one, so activating a different idea REPLACES it instead of
@@ -1164,7 +1168,7 @@ async def get_profile(user_id: str = Depends(get_current_user_id)):
         # Agent 3's resume is ready right after onboarding — independent of
         # whether an idea has been posted/activated yet, so this must not
         # only live behind /api/founder/status (which needs a live idea).
-        if state.user_type == "founder" and state.resume_path:
+        if state.user_type == "founder" and (state.resume_path or state.founder_profile):
             result["resume_url"] = f"/api/resume/{user_id}"
         if state.user_type == "investor":
             result["invested_in"] = _investor_deals((state.investor_profile or {}).get("id"))
@@ -1642,7 +1646,7 @@ async def founder_status(user_id: str = Depends(get_current_user_id)):
         result["my_idea"] = next(
             (i for i in state.ideas_pool if i.get("id") == state.active_idea_id), None
         )
-        result["resume_url"] = f"/api/resume/{user_id}" if state.resume_path else None
+        result["resume_url"] = f"/api/resume/{user_id}" if (state.resume_path or state.founder_profile) else None
         result["top_investors"] = state.shortlisted_investors[:8]
         result["meeting_requests"] = _serialize_meeting_requests(state)
         result["current_match"] = state.current_match
@@ -1659,13 +1663,38 @@ async def get_resume(owner_user_id: str, user_id: str = Depends(get_current_user
     matching/search works) — but a valid session is now actually required,
     instead of the file being reachable by anyone who ever saw its URL.
     """
-    # A plain lookup, not get_user_state() — that helper creates a fresh empty
-    # SessionState for any id it's never seen, which would let a request with
-    # a made-up owner_user_id silently pollute user_states with junk entries.
+    # A plain lookup first, not get_user_state() — that helper creates a
+    # fresh empty SessionState for any id it's never seen, which would let a
+    # request with a made-up owner_user_id silently pollute user_states with
+    # junk entries. Only fall through to get_user_state()+_hydrate_from_db
+    # below once we already know (from Postgres) that this id is real.
     with state_lock:
         owner_state = user_states.get(owner_user_id)
-    if not owner_state or not owner_state.resume_path or not os.path.isfile(owner_state.resume_path):
+
+    # The actual .docx (under static/resumes/) and owner_state.resume_path
+    # (only ever written to sessions_db.json, never to Postgres) both live
+    # on Render's ephemeral disk — a redeploy can wipe either or both, while
+    # founder_profile itself survives (durably persisted via db_store when
+    # DATABASE_URL is set). Rather than 404 a real founder whose file just
+    # didn't survive the last deploy, rebuild it on demand from the profile
+    # that's still there.
+    if not owner_state or not owner_state.founder_profile:
+        owner_state = get_user_state(owner_user_id)
+        await _hydrate_from_db(owner_state, owner_user_id)
+
+    if not owner_state.founder_profile:
         raise HTTPException(status_code=404, detail="Resume not found.")
+
+    if not owner_state.resume_path or not os.path.isfile(owner_state.resume_path):
+        try:
+            owner_state.resume_path = await asyncio.to_thread(
+                run_agent3, owner_state.founder_profile,
+                output_dir="static/resumes", unique_id=owner_user_id,
+            )
+            save_sessions()
+        except Exception:
+            raise HTTPException(status_code=503, detail="Could not rebuild the resume right now — please try again.")
+
     return FileResponse(
         owner_state.resume_path,
         filename=os.path.basename(owner_state.resume_path),
