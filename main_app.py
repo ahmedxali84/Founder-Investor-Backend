@@ -492,6 +492,24 @@ def get_user_state(user_id: str) -> SessionState:
 # rather than being masked for the rest of the TTL window.
 _TOKEN_VERIFY_TTL_SECONDS = 60
 _token_verify_cache: dict = {}  # sha256(token) -> (cached_at, user_data)
+# Swept on every write (see _purge_stale_token_cache below), not just on
+# access of the same key — Supabase issues a brand-new JWT on every session
+# refresh, so most entries here are never looked up again by their own key
+# once expired. Without a proactive sweep this dict would grow without bound
+# for the life of the process (same failure mode _purge_stale_oauth_states
+# already guards against for linkedin_oauth_states).
+_LAST_TOKEN_CACHE_PURGE = [0.0]  # mutable single-element list so it's assignable from a nested function
+
+
+def _purge_stale_token_cache():
+    now = time.time()
+    if now - _LAST_TOKEN_CACHE_PURGE[0] < _TOKEN_VERIFY_TTL_SECONDS:
+        return
+    _LAST_TOKEN_CACHE_PURGE[0] = now
+    cutoff = now - _TOKEN_VERIFY_TTL_SECONDS
+    stale = [k for k, (cached_at, _) in _token_verify_cache.items() if cached_at < cutoff]
+    for k in stale:
+        _token_verify_cache.pop(k, None)
 
 
 async def get_supabase_user(token: str) -> Optional[dict]:
@@ -506,9 +524,7 @@ async def get_supabase_user(token: str) -> Optional[dict]:
         if time.time() - cached[0] < _TOKEN_VERIFY_TTL_SECONDS:
             return cached[1]
         # Expired — drop it now rather than just falling through to
-        # overwrite it below. A token that's never rechecked again (user
-        # logged out, session ended) would otherwise sit here forever;
-        # this bounds the cache to tokens actually still in use.
+        # overwrite it below.
         _token_verify_cache.pop(cache_key, None)
 
     url = f"{supabase_url.rstrip('/')}/auth/v1/user"
@@ -522,6 +538,7 @@ async def get_supabase_user(token: str) -> Optional[dict]:
             if resp.status_code == 200:
                 user_data = resp.json()
                 _token_verify_cache[cache_key] = (time.time(), user_data)
+                _purge_stale_token_cache()
                 return user_data
     except Exception as e:
         print(f"Supabase auth check failed: {e}")
@@ -916,7 +933,14 @@ def _run_idea_activation_pipeline(user_id: str, idea_text: str, mvp_url: str, re
         # Agent 6's explicit "next best" flow does), so a fresh shortlist
         # here would otherwise resurface an investor right after rejecting
         # them, the moment a new idea is posted or the pool changes.
-        candidate_investors = [inv for inv in state.investors_pool if inv.get("id") not in state.rejected_ids]
+        # Snapshot under pool_lock — this runs on a real worker thread
+        # (BackgroundTasks/asyncio.to_thread), so iterating the live shared
+        # list while another thread's `with pool_lock: POOL[:] = ...`
+        # reassignment is mid-flight is a genuine cross-thread hazard, not
+        # just GIL trivia.
+        with pool_lock:
+            investors_snapshot = list(state.investors_pool)
+        candidate_investors = [inv for inv in investors_snapshot if inv.get("id") not in state.rejected_ids]
         top_ideas, top_investors = [], []
         try:
             top_ideas, top_investors, _ = store.run_and_record(
@@ -978,12 +1002,18 @@ def _run_investor_matching(user_id: str, profile_data: dict, investor_id: str):
     session_ref = state.session_id
 
     # Agent 4: Shortlist — excludes ideas this investor already passed on
-    # (see the matching comment in _run_idea_activation_pipeline).
-    candidate_ideas = [i for i in state.ideas_pool if i.get("id") not in state.rejected_ids]
+    # (see the matching comment in _run_idea_activation_pipeline). Snapshot
+    # both pools under pool_lock — this runs on a real worker thread, so an
+    # unlocked read can race a concurrent `with pool_lock: POOL[:] = ...`
+    # write on another thread.
+    with pool_lock:
+        ideas_snapshot = list(state.ideas_pool)
+        investors_snapshot = list(state.investors_pool)
+    candidate_ideas = [i for i in ideas_snapshot if i.get("id") not in state.rejected_ids]
     top_ideas, top_investors = [], []
     try:
         top_ideas, top_investors, _ = store.run_and_record(
-            "agent4", user_id, session_ref, run_agent4, candidate_ideas, state.investors_pool, limit=25
+            "agent4", user_id, session_ref, run_agent4, candidate_ideas, investors_snapshot, limit=25
         )
         state.shortlisted_ideas = top_ideas
         state.shortlisted_investors = top_investors
@@ -2160,8 +2190,31 @@ async def my_connections(user_id: str = Depends(get_current_user_id)):
 # REJECTION / NEXT-BEST MATCH (Agent 6)
 # ---------------------------------------------------------------------------
 
+# A double-click (or two tabs on the same match) both reading the same
+# state.current_match/shortlisted_* snapshot and each kicking off their own
+# Agent 6 call is a wasted-LLM-call/lost-update race, not data corruption
+# (rejected_ids.add is idempotent either way) — but there's no reason to pay
+# for two concurrent Groq calls to reject the same match once. Same pattern
+# as _in_flight_reruns above, scoped to user_id since only one reject is
+# ever meaningful in flight per user at a time.
+_in_flight_rejects: set = set()
+_in_flight_rejects_lock = threading.Lock()
+
+
 @app.post("/api/reject")
 async def reject_match(user_id: str = Depends(get_current_user_id)):
+    with _in_flight_rejects_lock:
+        if user_id in _in_flight_rejects:
+            raise HTTPException(status_code=409, detail="Your last reject is still processing — please wait.")
+        _in_flight_rejects.add(user_id)
+    try:
+        return await _reject_match_impl(user_id)
+    finally:
+        with _in_flight_rejects_lock:
+            _in_flight_rejects.discard(user_id)
+
+
+async def _reject_match_impl(user_id: str):
     state = get_user_state(user_id)
     if not state.current_match:
         raise HTTPException(status_code=400, detail="No active match to reject.")
@@ -2363,8 +2416,27 @@ async def agents_status(user_id: str = Depends(get_current_user_id)):
     return {"agents": store.list_profiles(user_id)}
 
 
+# Guards against a double-click (or a slow-network auto-retry) firing two
+# overlapping reruns for the same (agent_id, user_id). Without this, two
+# concurrent store.run_and_record calls for the same key race their
+# "running"/"done" SQLite writes — each opens its own connection and the
+# ON CONFLICT DO UPDATE is atomic per-write, but there's no coordination
+# between the two calls, so whichever happens to finish last wins even if
+# it was the one that started first (an older, possibly-failed run's status
+# can clobber a newer, successful one's). Rejecting the second request
+# outright is simpler and safer than trying to reconcile out-of-order
+# completions after the fact.
+_in_flight_reruns: set = set()
+_in_flight_reruns_lock = threading.Lock()
+
+
 @app.post("/api/agents/{agent_id}/rerun")
 async def rerun_agent(agent_id: str, user_id: str = Depends(get_current_user_id)):
+    key = (agent_id, user_id)
+    with _in_flight_reruns_lock:
+        if key in _in_flight_reruns:
+            raise HTTPException(status_code=409, detail="This step is already running — please wait for it to finish.")
+        _in_flight_reruns.add(key)
     try:
         res = await _dispatch_rerun(agent_id, user_id)
         save_sessions()
@@ -2373,6 +2445,9 @@ async def rerun_agent(agent_id: str, user_id: str = Depends(get_current_user_id)
         raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
+    finally:
+        with _in_flight_reruns_lock:
+            _in_flight_reruns.discard(key)
 
 
 async def _dispatch_rerun(agent_id: str, user_id: str):
@@ -2424,13 +2499,24 @@ async def _dispatch_rerun(agent_id: str, user_id: str):
         )
 
     elif agent_id == "agent4":
-        candidate_ideas = [i for i in state.ideas_pool if i.get("id") not in state.rejected_ids] if state.user_type == "investor" else state.ideas_pool
-        candidate_investors = [inv for inv in state.investors_pool if inv.get("id") not in state.rejected_ids] if state.user_type == "founder" else state.investors_pool
+        # Snapshot under pool_lock — a concurrent pipeline run for another
+        # user (BackgroundTasks/asyncio.to_thread, real worker threads) can
+        # be mid-write on these same shared lists.
+        with pool_lock:
+            ideas_snapshot = list(state.ideas_pool)
+            investors_snapshot = list(state.investors_pool)
+        candidate_ideas = [i for i in ideas_snapshot if i.get("id") not in state.rejected_ids] if state.user_type == "investor" else ideas_snapshot
+        candidate_investors = [inv for inv in investors_snapshot if inv.get("id") not in state.rejected_ids] if state.user_type == "founder" else investors_snapshot
         top_ideas, top_investors, _ = await asyncio.to_thread(
             store.run_and_record,
             "agent4", user_id, session_ref, run_agent4, candidate_ideas, candidate_investors, limit=25
         )
-        state.shortlisted_ideas, state.shortlisted_investors = top_ideas, top_investors
+        # Re-filter against rejected_ids as it stands NOW, not as it stood
+        # before the (potentially multi-second) Groq call above — a reject
+        # made from another tab while this was in flight must not resurface
+        # here just because it was assembled from a stale pre-await snapshot.
+        state.shortlisted_ideas = [i for i in top_ideas if i.get("id") not in state.rejected_ids]
+        state.shortlisted_investors = [inv for inv in top_investors if inv.get("id") not in state.rejected_ids]
 
     elif agent_id == "agent5":
         if not state.shortlisted_ideas or not state.shortlisted_investors:
