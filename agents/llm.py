@@ -94,6 +94,14 @@ def ask_llm(prompt: str, system_prompt: str = "You are a helpful assistant.", _m
                         continue
                     break
 
+                if resp.status_code >= 400 and resp.status_code != 429:
+                    error_body = {}
+                    try:
+                        error_body = resp.json().get("error", {})
+                    except Exception:
+                        pass
+                    print(f"[Groq Diagnostic] HTTP {resp.status_code} | message={error_body.get('message')} | type={error_body.get('type')} | code={error_body.get('code')} | failed_generation={error_body.get('failed_generation')}")
+                
                 resp.raise_for_status()
                 return resp.json()["choices"][0]["message"]["content"]
             except Exception as exc:
