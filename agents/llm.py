@@ -45,6 +45,45 @@ class GroqQuotaExhaustedError(Exception):
 
 FALLBACK_MODELS = ["openai/gpt-oss-20b"]
 
+
+def validate_configured_models() -> None:
+    """
+    Best-effort startup check: ping Groq's real model list and log loudly if
+    GROQ_MODEL or any FALLBACK_MODELS entry isn't on it. Added after the
+    incident where every one of these models had been silently decommissioned
+    by Groq — nothing caught it until a user's pipeline step got stuck on
+    "Needs attention" and we had to trace a raw HTTPError back through the
+    dashboard. This makes that same failure visible in the startup logs
+    immediately instead. Never raises — a transient network hiccup at boot
+    (or GROQ_API_KEY being unset, which ask_llm already handles its own way)
+    must not be able to take the whole app down.
+    """
+    if not GROQ_API_KEY:
+        return
+    try:
+        resp = requests.get(
+            "https://api.groq.com/openai/v1/models",
+            headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+            timeout=8,
+        )
+        resp.raise_for_status()
+        available = {m.get("id") for m in resp.json().get("data", [])}
+    except Exception as exc:
+        print(f"[startup] Could not verify configured Groq models (network/API issue, continuing anyway): {exc}")
+        return
+
+    configured = [GROQ_MODEL] + [m for m in FALLBACK_MODELS if m != GROQ_MODEL]
+    missing = [m for m in configured if m not in available]
+    if missing:
+        print(
+            f"[startup] WARNING: Groq model(s) not available on this account: {missing}. "
+            "Every LLM-backed agent using this model will fail until GROQ_MODEL/FALLBACK_MODELS "
+            "in agents/llm.py (or the GROQ_MODEL env var) are updated — see "
+            "https://console.groq.com/docs/deprecations and https://console.groq.com/docs/models"
+        )
+    else:
+        print(f"[startup] Groq model chain OK: {configured}")
+
 def ask_llm(prompt: str, system_prompt: str = "You are a helpful assistant.", _max_retries: int = 3, api_key: str = "") -> str:
     """Send a prompt to Groq and return the text reply. Retries with backoff on 429 (rate limit).
     Falls back to secondary models if the primary model daily token quota is exhausted.
@@ -101,7 +140,7 @@ def ask_llm(prompt: str, system_prompt: str = "You are a helpful assistant.", _m
                     except Exception:
                         pass
                     print(f"[Groq Diagnostic] HTTP {resp.status_code} | message={error_body.get('message')} | type={error_body.get('type')} | code={error_body.get('code')} | failed_generation={error_body.get('failed_generation')}")
-                
+
                 resp.raise_for_status()
                 return resp.json()["choices"][0]["message"]["content"]
             except Exception as exc:

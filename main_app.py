@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote, urlparse, urljoin
 from typing import Optional
-from fastapi import FastAPI, Form, HTTPException, BackgroundTasks, Depends, Header, UploadFile, File
+from fastapi import FastAPI, Form, HTTPException, BackgroundTasks, Depends, Header, UploadFile, File, Request
 from fastapi.responses import JSONResponse, RedirectResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
@@ -37,6 +37,7 @@ from agents import (
     run_agent6_for_investor,
     run_agent7,
 )
+import agents.llm as agents_llm
 from agents.agent5 import match_score
 from agents.data import IDEAS_POOL, INVESTORS_POOL
 from agents import store
@@ -97,6 +98,9 @@ async def _startup():
     run_schema_migrations()
     load_sessions()
     await _hydrate_pools_from_db()
+    # Off the event loop since it's a real network call — best-effort, never
+    # blocks/fails startup (see validate_configured_models's own docstring).
+    await asyncio.to_thread(agents_llm.validate_configured_models)
 
 # CORS middleware for React Vite frontend integration.
 # allow_origins=["*"] combined with allow_credentials=True lets Starlette
@@ -127,6 +131,25 @@ app.add_middleware(
     # doesn't need an extra env-var gate to stay safe.
     allow_origin_regex=r"https://.*\.vercel\.app",
 )
+
+_VERCEL_ORIGIN_RE = re.compile(r"^https://[a-zA-Z0-9.-]+\.vercel\.app$")
+
+
+def _trusted_frontend_origin(origin: str) -> Optional[str]:
+    """
+    Same trust boundary as the CORS config above (explicit _cors_origins list
+    plus any *.vercel.app subdomain) — reused so the LinkedIn OAuth callback
+    can redirect back to whichever frontend origin actually initiated the
+    flow instead of a single hardcoded/env-configured URL that's easy to
+    leave unset or stale in a given deployment.
+    """
+    origin = (origin or "").rstrip("/")
+    if not origin:
+        return None
+    if origin in _cors_origins or _VERCEL_ORIGIN_RE.match(origin):
+        return origin
+    return None
+
 
 # Lightweight, dependency-free abuse guard + browser hardening headers. Not a
 # substitute for a real edge/WAF rate limiter in front of a production
@@ -308,20 +331,25 @@ state_lock = threading.Lock()
 # data into the repo's actual sessions_db.json during a test run.
 DB_FILE = os.getenv("SESSIONS_DB_FILE") or "sessions_db.json"
 
-# In-memory map of in-flight LinkedIn OAuth "state" tokens -> (user_id, created_at).
-# LinkedIn's redirect back to /api/linkedin/callback is a plain browser
-# navigation with no Authorization header, so this is how we know which app
-# user just proved who they are on LinkedIn. Entries are removed once the
-# handshake completes; _purge_stale_oauth_states() also sweeps out anyone who
-# abandoned the flow (closed the tab, denied access) so this dict can't grow
-# without bound over the process's lifetime.
+# In-memory map of in-flight LinkedIn OAuth "state" tokens ->
+# (user_id, created_at, frontend_origin). LinkedIn's redirect back to
+# /api/linkedin/callback is a plain browser navigation with no Authorization
+# header, so this is how we know which app user just proved who they are on
+# LinkedIn — and frontend_origin (captured from the Origin/Referer of the
+# /api/linkedin/login request that started this flow) is how the callback
+# knows where to redirect back to, instead of relying on a single
+# env-configured FRONTEND_URL that's easy to leave unset in a given
+# deployment. Entries are removed once the handshake completes;
+# _purge_stale_oauth_states() also sweeps out anyone who abandoned the flow
+# (closed the tab, denied access) so this dict can't grow without bound over
+# the process's lifetime.
 linkedin_oauth_states = {}
 _OAUTH_STATE_TTL_SECONDS = 600  # 10 minutes is generous for a login redirect round-trip
 
 
 def _purge_stale_oauth_states():
     cutoff = time.time() - _OAUTH_STATE_TTL_SECONDS
-    stale = [tok for tok, (_, created_at) in linkedin_oauth_states.items() if created_at < cutoff]
+    stale = [tok for tok, (_, created_at, _fo) in linkedin_oauth_states.items() if created_at < cutoff]
     for tok in stale:
         linkedin_oauth_states.pop(tok, None)
 
@@ -1299,7 +1327,7 @@ async def github_search(name: str, user_id: str = Depends(get_current_user_id)):
 
 
 @app.get("/api/linkedin/login")
-async def linkedin_login(user_id: str = Depends(get_current_user_id)):
+async def linkedin_login(request: Request, user_id: str = Depends(get_current_user_id)):
     """
     Kicks off real 'Sign in with LinkedIn' (OpenID Connect). Returns the
     LinkedIn authorization URL for the frontend to redirect the browser to.
@@ -1314,7 +1342,16 @@ async def linkedin_login(user_id: str = Depends(get_current_user_id)):
         )
     _purge_stale_oauth_states()
     state_token = str(uuid.uuid4())
-    linkedin_oauth_states[state_token] = (user_id, time.time())
+    # Prefer the Origin header (present on this fetch() call from the
+    # frontend); fall back to Referer's origin for any client that omits it.
+    origin_header = request.headers.get("origin", "")
+    if not origin_header:
+        referer = request.headers.get("referer", "")
+        if referer:
+            parsed = urlparse(referer)
+            origin_header = f"{parsed.scheme}://{parsed.netloc}" if parsed.netloc else ""
+    frontend_origin = _trusted_frontend_origin(origin_header)
+    linkedin_oauth_states[state_token] = (user_id, time.time(), frontend_origin)
     authorize_url = linkedin_oauth.build_authorization_url(state=state_token)
     return {"authorize_url": authorize_url}
 
@@ -1326,14 +1363,18 @@ async def linkedin_callback(code: str = "", state: str = "", error: Optional[str
     approves access. Exchanges the code for their real, LinkedIn-confirmed
     name/email/picture and stores it against the user who started the flow.
     """
-    frontend_url = os.getenv("FRONTEND_URL", "http://localhost:3000").rstrip("/")
+    # Look up the state entry (if any) before branching on error/code/state,
+    # so even the early error-redirect below can send the browser back to
+    # the actual frontend origin that started this flow, not a static
+    # fallback. LinkedIn always echoes `state` back, success or failure.
+    entry = linkedin_oauth_states.pop(state, None) if state else None
+    user_id, _created_at, stored_frontend_origin = entry if entry else (None, None, None)
+    frontend_url = stored_frontend_origin or os.getenv("FRONTEND_URL", "http://localhost:3000").rstrip("/")
 
     if error or not code or not state:
         print(f"LinkedIn OAuth callback missing params: error={error!r} code_present={bool(code)} state_present={bool(state)}")
         return RedirectResponse(url=f"{frontend_url}/onboarding?linkedin=error&reason=denied_or_missing_params")
 
-    entry = linkedin_oauth_states.pop(state, None)
-    user_id = entry[0] if entry else None
     if not user_id:
         # Most common cause: the backend process restarted (e.g. --reload
         # picked up a file change) between /api/linkedin/login and this
