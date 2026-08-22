@@ -1629,6 +1629,49 @@ async def activate_idea(
     }
 
 
+@app.delete("/api/founder/idea/active")
+async def delete_active_idea(user_id: str = Depends(get_current_user_id)):
+    """
+    Removes this founder's currently-live idea from the shared matching pool
+    (and any meeting requests tied to it) without touching the rest of their
+    account. Mirrors the idea-cleanup half of /api/account's delete_account,
+    since a founder can only ever have one pool entry — same reasoning: the
+    pool/meeting-request state lives outside Supabase's foreign-key cascade,
+    so it has to be cleaned up by hand here.
+    """
+    state = get_user_state(user_id)
+
+    removed_idea_id = None
+    with pool_lock:
+        remaining_ideas = []
+        for idea in GLOBAL_IDEAS_POOL:
+            if idea.get("owner_user_id") == user_id:
+                removed_idea_id = idea.get("id")
+            else:
+                remaining_ideas.append(idea)
+        GLOBAL_IDEAS_POOL[:] = remaining_ideas
+
+    await asyncio.to_thread(db_store.delete_ideas_by_owner, user_id)
+
+    if removed_idea_id:
+        with meeting_lock:
+            for key in [
+                k for k, slot in GLOBAL_MEETING_REQUESTS.items()
+                if slot.get("idea_id") == removed_idea_id
+            ]:
+                del GLOBAL_MEETING_REQUESTS[key]
+        await asyncio.to_thread(db_store.delete_meeting_requests_by_owner, user_id)
+
+    with state_lock:
+        state.active_idea_id = None
+        state.idea_ever_activated = False
+        state.current_match = None
+        state.agent_ready = False
+    save_sessions()
+
+    return {"success": True}
+
+
 @app.get("/api/founder/status")
 async def founder_status(user_id: str = Depends(get_current_user_id)):
     state = get_user_state(user_id)
