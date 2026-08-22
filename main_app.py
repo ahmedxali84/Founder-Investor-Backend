@@ -643,6 +643,7 @@ async def _hydrate_from_db(state, user_id: str):
         state.user_type = "founder"
         state.founder_profile = founder_row["profile"]
         state.founder_raw_input = {"linkedin": founder_row["linkedin"], "github": founder_row["github"]}
+        await _hydrate_rejected_ids(state, user_id)
         return
 
     investor_row = await asyncio.to_thread(db_store.load_investor_profile, user_id)
@@ -650,6 +651,22 @@ async def _hydrate_from_db(state, user_id: str):
         state.user_type = "investor"
         state.investor_profile = investor_row["profile"]
         state.investor_raw_input = {"linkedin": investor_row["linkedin"]}
+        await _hydrate_rejected_ids(state, user_id)
+
+
+async def _hydrate_rejected_ids(state, user_id: str):
+    """
+    Loads durable rejected_ids from Postgres for a SessionState that's cold
+    (no user_type in memory yet, or one that was just restored by
+    _hydrate_from_db above). Only used for the "fresh in this process"
+    case — a state already carrying rejected_ids in memory is left alone
+    rather than being overwritten by a possibly-stale read.
+    """
+    if state.rejected_ids:
+        return
+    ids = await asyncio.to_thread(db_store.load_rejected_ids, user_id)
+    if ids:
+        state.rejected_ids = set(ids)
 
 
 def _is_valid_url(url: str) -> bool:
@@ -1984,15 +2001,18 @@ def _investor_deals(investor_id: str) -> list[dict]:
 
 
 def _investor_has_other_confirmed_deal(investor_id: str, excluding_idea_id: str) -> bool:
-    """True if this investor already has a *different* confirmed deal — used
-    to block a new founder from requesting a meeting with an investor who's
-    already committed elsewhere. They stay visible in search (see
-    _investor_deals), just not approachable for a second deal; new
-    connections still only happen through the Agent 4/5 matching pipeline."""
+    """True if this investor already has a *different*, still-active confirmed
+    deal — used to block a new founder from requesting a meeting with an
+    investor who's already committed elsewhere. They stay visible in search
+    (see _investor_deals), just not approachable for a second deal; new
+    connections still only happen through the Agent 4/5 matching pipeline.
+    A deal marked completed (see /api/complete-deal) no longer counts here —
+    finishing a deal frees both parties up for a new one."""
     with meeting_lock:
         return any(
             slot.get("investor_id") == investor_id
             and slot.get("both_opted_in")
+            and not slot.get("completed")
             and slot.get("idea_id") != excluding_idea_id
             for slot in GLOBAL_MEETING_REQUESTS.values()
         )
@@ -2001,11 +2021,12 @@ def _investor_has_other_confirmed_deal(investor_id: str, excluding_idea_id: str)
 def _idea_has_other_confirmed_deal(idea_id: str, excluding_investor_id: str) -> bool:
     """Mirror of _investor_has_other_confirmed_deal for the founder/idea side —
     blocks a new investor from raising their hand on a startup that's already
-    confirmed a deal with someone else."""
+    confirmed a deal with someone else, unless that deal has been completed."""
     with meeting_lock:
         return any(
             slot.get("idea_id") == idea_id
             and slot.get("both_opted_in")
+            and not slot.get("completed")
             and slot.get("investor_id") != excluding_investor_id
             for slot in GLOBAL_MEETING_REQUESTS.values()
         )
@@ -2034,6 +2055,7 @@ def _serialize_meeting_requests(state):
                     "founder_requested": slot.get("founder_requested", False),
                     "investor_raised": slot.get("investor_raised", False),
                     "both_opted_in": slot.get("both_opted_in", False),
+                    "completed": slot.get("completed", False),
                     "investor": slot.get("investor"),
                     "updated_at": slot.get("updated_at") or slot.get("created_at"),
                 })
@@ -2049,6 +2071,7 @@ def _serialize_meeting_requests(state):
                     "founder_requested": slot.get("founder_requested", False),
                     "investor_raised": slot.get("investor_raised", False),
                     "both_opted_in": slot.get("both_opted_in", False),
+                    "completed": slot.get("completed", False),
                     "idea": slot.get("idea"),
                     "updated_at": slot.get("updated_at") or slot.get("created_at"),
                 })
@@ -2214,6 +2237,56 @@ async def raise_hand(data: dict, user_id: str = Depends(get_current_user_id)):
     }
 
 
+@app.post("/api/complete-deal")
+async def complete_deal(data: dict, user_id: str = Depends(get_current_user_id)):
+    """
+    Marks a confirmed deal as finished — the founder actually built and
+    delivered the project with this investor (or vice versa). Either party
+    can mark it done unilaterally, the same one-sided pattern /api/reject
+    already uses. This is a genuinely missing concept until now: a confirmed
+    slot (both_opted_in=True) previously had no further state and no way to
+    ever be released, so it permanently occupied that investor's/founder's
+    one-deal slot (see _investor_has_other_confirmed_deal /
+    _idea_has_other_confirmed_deal) even after the collaboration concluded.
+    `data["id"]` is "the other party's id" — investor_id if the caller is a
+    founder, idea_id if the caller is an investor — matching the same shape
+    _serialize_meeting_requests already returns to the frontend, so the
+    button that calls this can reuse the id it's already rendering from.
+    """
+    state = get_user_state(user_id)
+    other_id = (data or {}).get("id", "")
+    if not other_id:
+        raise HTTPException(status_code=400, detail="id is required.")
+
+    if state.user_type == "founder":
+        idea_id = state.active_idea_id
+        if not idea_id:
+            raise HTTPException(status_code=400, detail="No active idea.")
+        key = _meeting_key(idea_id, other_id)
+    elif state.user_type == "investor":
+        my_investor_id = (state.investor_profile or {}).get("id")
+        if not my_investor_id:
+            raise HTTPException(status_code=400, detail="No investor profile.")
+        key = _meeting_key(other_id, my_investor_id)
+    else:
+        raise HTTPException(status_code=403, detail="No active session.")
+
+    with meeting_lock:
+        slot = GLOBAL_MEETING_REQUESTS.get(key)
+        if not slot or not slot.get("both_opted_in"):
+            raise HTTPException(status_code=404, detail="No confirmed deal found for this pairing.")
+        if slot.get("completed"):
+            return {"success": True, "already_completed": True}
+        slot["completed"] = True
+        slot["completed_at"] = datetime.now(timezone.utc).isoformat()
+        slot["updated_at"] = slot["completed_at"]
+        slot_copy = dict(slot)
+
+    await asyncio.to_thread(db_store.save_meeting_request, slot_copy)
+    save_sessions()
+    return {"success": True, "completed_at": slot_copy["completed_at"]}
+
+
 @app.get("/api/my-connections")
 async def my_connections(user_id: str = Depends(get_current_user_id)):
     state = get_user_state(user_id)
@@ -2258,9 +2331,29 @@ async def _reject_match_impl(user_id: str):
 
     if state.user_type == "founder":
         idea = state.current_match["idea"]
-        rejected_investor_id = state.current_match["investor"].get("id")
+        rejected_investor = state.current_match["investor"]
+        rejected_investor_id = rejected_investor.get("id")
         if rejected_investor_id:
             state.rejected_ids.add(rejected_investor_id)
+
+        # Bidirectional: rejection used to only update the rejecter's own
+        # future shortlist — the rejected investor's own state was never
+        # touched, so they could keep being shown this same idea (and keep
+        # sending meeting requests at it) even though the founder had
+        # already declined them. Mirror the rejection onto the investor's
+        # own account so it sticks from both directions. Hydrate their state
+        # first (in case this process has never touched it) so a fresh,
+        # nearly-empty SessionState doesn't get written back to Postgres and
+        # clobber their real rejection history there.
+        investor_owner_id = rejected_investor.get("owner_user_id")
+        idea_id = idea.get("id")
+        if investor_owner_id and idea_id:
+            other_state = get_user_state(investor_owner_id)
+            await _hydrate_from_db(other_state, investor_owner_id)
+            other_state.rejected_ids.add(idea_id)
+            await asyncio.to_thread(db_store.save_rejected_ids, investor_owner_id, other_state.rejected_ids)
+
+        await asyncio.to_thread(db_store.save_rejected_ids, user_id, state.rejected_ids)
 
         try:
             next_investor, log_msg = await asyncio.to_thread(
@@ -2288,9 +2381,23 @@ async def _reject_match_impl(user_id: str):
 
     elif state.user_type == "investor":
         investor = state.current_match["investor"]
-        rejected_idea_id = state.current_match["idea"].get("id")
+        rejected_idea = state.current_match["idea"]
+        rejected_idea_id = rejected_idea.get("id")
         if rejected_idea_id:
             state.rejected_ids.add(rejected_idea_id)
+
+        # Bidirectional — see the matching comment in the founder branch
+        # above: mirror the rejection onto the idea owner's own account so
+        # the founder stops seeing/pursuing this investor too.
+        founder_owner_id = rejected_idea.get("owner_user_id")
+        investor_id = investor.get("id")
+        if founder_owner_id and investor_id:
+            other_state = get_user_state(founder_owner_id)
+            await _hydrate_from_db(other_state, founder_owner_id)
+            other_state.rejected_ids.add(investor_id)
+            await asyncio.to_thread(db_store.save_rejected_ids, founder_owner_id, other_state.rejected_ids)
+
+        await asyncio.to_thread(db_store.save_rejected_ids, user_id, state.rejected_ids)
 
         try:
             next_idea, log_msg = await asyncio.to_thread(

@@ -122,6 +122,58 @@ def load_investor_profile(user_id: str):
         conn.close()
 
 
+def save_rejected_ids(user_id: str, rejected_ids) -> bool:
+    """
+    Durable write-through for SessionState.rejected_ids — previously only
+    ever lived in sessions_db.json on ephemeral disk, so a redeploy silently
+    reset everyone's rejection history and previously-declined matches would
+    resurface. `rejected_ids` may be a set or list; always stored as a
+    sorted list for a stable, diffable JSON representation.
+    """
+    conn = _get_connection()
+    if not conn:
+        return False
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    insert into public.user_rejections (user_id, rejected_ids)
+                    values (%s, %s)
+                    on conflict (user_id) do update set
+                        rejected_ids = excluded.rejected_ids,
+                        updated_at = now()
+                    """,
+                    (user_id, json.dumps(sorted(rejected_ids), default=str)),
+                )
+        return True
+    except Exception as e:
+        print(f"[db_store] save_rejected_ids failed: {e}")
+        return False
+    finally:
+        conn.close()
+
+
+def load_rejected_ids(user_id: str):
+    """Returns a list of ids (never None on success — an unknown user just has no rejections yet)."""
+    conn = _get_connection()
+    if not conn:
+        return None
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "select rejected_ids from public.user_rejections where user_id = %s",
+                (user_id,),
+            )
+            row = cur.fetchone()
+        return row[0] if row else []
+    except Exception as e:
+        print(f"[db_store] load_rejected_ids failed: {e}")
+        return None
+    finally:
+        conn.close()
+
+
 # ---------------------------------------------------------------------------
 # Write-through durability for the shared marketplace pools (GLOBAL_IDEAS_POOL
 # / GLOBAL_INVESTORS_POOL / GLOBAL_MEETING_REQUESTS in main_app.py). Those
@@ -369,8 +421,9 @@ def save_meeting_request(slot: dict) -> bool:
                     insert into public.meeting_requests
                         (idea_id, investor_id, founder_user_id, investor_user_id,
                          founder_requested, investor_raised, both_opted_in,
-                         idea_snapshot, investor_snapshot, created_at, updated_at)
-                    values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now())
+                         idea_snapshot, investor_snapshot, created_at, updated_at,
+                         completed, completed_at)
+                    values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now(), %s, %s)
                     on conflict (idea_id, investor_id) do update set
                         founder_user_id = excluded.founder_user_id,
                         investor_user_id = excluded.investor_user_id,
@@ -379,6 +432,8 @@ def save_meeting_request(slot: dict) -> bool:
                         both_opted_in = excluded.both_opted_in,
                         idea_snapshot = excluded.idea_snapshot,
                         investor_snapshot = excluded.investor_snapshot,
+                        completed = excluded.completed,
+                        completed_at = excluded.completed_at,
                         updated_at = now()
                     """,
                     (
@@ -392,6 +447,8 @@ def save_meeting_request(slot: dict) -> bool:
                         json.dumps(idea_snapshot, default=str),
                         json.dumps(investor_snapshot, default=str),
                         created_at,
+                        bool(slot.get("completed")),
+                        slot.get("completed_at"),
                     ),
                 )
         return True
@@ -416,7 +473,8 @@ def load_all_meeting_requests() -> list:
             cur.execute(
                 """
                 select idea_id, investor_id, founder_requested, investor_raised, both_opted_in,
-                       idea_snapshot, investor_snapshot, created_at, updated_at
+                       idea_snapshot, investor_snapshot, created_at, updated_at,
+                       completed, completed_at
                 from public.meeting_requests
                 """
             )
@@ -432,6 +490,8 @@ def load_all_meeting_requests() -> list:
                 "investor": r[6],
                 "created_at": r[7].isoformat() if r[7] else None,
                 "updated_at": r[8].isoformat() if r[8] else None,
+                "completed": r[9],
+                "completed_at": r[10].isoformat() if r[10] else None,
             }
             for r in rows
         ]
