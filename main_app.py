@@ -765,10 +765,14 @@ async def _ensure_conversation(founder_user_id: Optional[str], investor_user_id:
                 headers=headers,
                 # PostgREST's ignore-duplicates upsert only no-ops on a conflict
                 # if told which constraint to match against — the unique
-                # constraint here is (founder_user_id, investor_user_id), not
-                # the primary key, so on_conflict must name it explicitly or
-                # this 409s instead of silently succeeding on a repeat call.
-                params={"on_conflict": "founder_user_id,investor_user_id"},
+                # constraint here is (founder_user_id, investor_user_id,
+                # idea_ref), not the primary key, so on_conflict must name it
+                # explicitly or this 409s instead of silently succeeding on a
+                # repeat call. idea_ref is part of the key (not just the pair)
+                # so a second deal between the same two people, on a
+                # different idea, gets its own conversation instead of
+                # silently reusing the first one's.
+                params={"on_conflict": "founder_user_id,investor_user_id,idea_ref"},
                 json={
                     "founder_user_id": founder_user_id,
                     "investor_user_id": investor_user_id,
