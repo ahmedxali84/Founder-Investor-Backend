@@ -13,6 +13,8 @@ import logging
 import datetime
 from contextlib import contextmanager
 
+from agents.db import get_connection as _pg_get_connection, get_database_url
+
 logger = logging.getLogger("agent_store")
 if not logger.handlers:
     handler = logging.StreamHandler()
@@ -90,6 +92,82 @@ def _safe_json(obj) -> str:
     return text
 
 
+def _pg_save_profile(agent_id, user_id, task_type, status, output_json, error, session_ref, now):
+    """
+    Best-effort write-through to Postgres — SQLite (above) stays the fast
+    local cache this module always reads first, but SQLite lives on
+    Render's ephemeral disk and is wiped on every redeploy. Without this,
+    every user's "Your Progress" dashboard silently reset to "Waiting" on
+    every step after any deploy, even though the underlying work (profile,
+    resume, matches) was untouched and already durable elsewhere. Never
+    raises — same swallow-and-log philosophy as the SQLite write above.
+    """
+    if not get_database_url():
+        return
+    conn = None
+    try:
+        conn = _pg_get_connection()
+        if not conn:
+            return
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    insert into public.agent_run_status
+                        (agent_id, user_id, task_type, status, last_output, error, session_ref, updated_at)
+                    values (%s, %s, %s, %s, %s, %s, %s, now())
+                    on conflict (agent_id, user_id) do update set
+                        task_type = excluded.task_type,
+                        status = excluded.status,
+                        last_output = excluded.last_output,
+                        error = excluded.error,
+                        session_ref = excluded.session_ref,
+                        updated_at = now()
+                    """,
+                    (agent_id, user_id, task_type, status, output_json, error, session_ref),
+                )
+    except Exception:
+        logger.exception("Failed to write-through agent_run_status for agent_id=%s user_id=%s", agent_id, user_id)
+    finally:
+        if conn:
+            conn.close()
+
+
+def _pg_load_profiles(user_id: str) -> dict:
+    """Returns {agent_id: row_dict} from Postgres, or {} if unavailable — used as the
+    durability fallback in list_profiles when SQLite's local cache was wiped."""
+    if not get_database_url():
+        return {}
+    conn = None
+    try:
+        conn = _pg_get_connection()
+        if not conn:
+            return {}
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                select agent_id, task_type, status, last_output, error, session_ref, updated_at
+                from public.agent_run_status where user_id = %s
+                """,
+                (user_id,),
+            )
+            rows = cur.fetchall()
+        return {
+            r[0]: {
+                "task_type": r[1], "status": r[2], "last_output": r[3],
+                "error": r[4], "session_ref": r[5],
+                "updated_at": r[6].isoformat() if r[6] else None,
+            }
+            for r in rows
+        }
+    except Exception:
+        logger.exception("Failed to read agent_run_status for user_id=%s", user_id)
+        return {}
+    finally:
+        if conn:
+            conn.close()
+
+
 def save_profile(agent_id: str, user_id: str, status: str, output=None, error: str = None, session_ref: str = "—"):
     """
     Upsert the latest known status/output for one (agent_id, user_id) pair.
@@ -117,9 +195,13 @@ def save_profile(agent_id: str, user_id: str, status: str, output=None, error: s
     except Exception:
         logger.exception("Failed to save profile for agent_id=%s user_id=%s (status=%s)", agent_id, user_id, status)
 
+    _pg_save_profile(agent_id, user_id, task_type, status, output_json, error, session_ref, now)
+
 
 def list_profiles(user_id: str) -> list:
-    """Every registry entry merged with this user's stored row, defaulting to idle if never run."""
+    """Every registry entry merged with this user's stored row, defaulting to idle if never run.
+    Falls back to Postgres per-agent when SQLite's local cache doesn't have that row —
+    e.g. right after a redeploy wiped SQLite but Postgres still has the real status."""
     rows_by_id = {}
     try:
         with _connect() as conn:
@@ -128,6 +210,13 @@ def list_profiles(user_id: str) -> list:
                 rows_by_id[row["agent_id"]] = dict(row)
     except Exception:
         logger.exception("Failed to read agent profiles for user_id=%s", user_id)
+
+    missing = [agent_id for agent_id in AGENT_REGISTRY if agent_id not in rows_by_id]
+    if missing:
+        pg_rows = _pg_load_profiles(user_id)
+        for agent_id in missing:
+            if agent_id in pg_rows:
+                rows_by_id[agent_id] = pg_rows[agent_id]
 
     result = []
     for agent_id, meta in AGENT_REGISTRY.items():
